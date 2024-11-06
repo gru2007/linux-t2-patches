@@ -1,21 +1,21 @@
-From 6412e9d1acf04518cfefbe6a1cfb03aae18cfe6e Mon Sep 17 00:00:00 2001
+From 6a7ae98b3893fff335a5e0c0e4442af065a60a07 Mon Sep 17 00:00:00 2001
 From: "github-actions[bot]"
  <41898282+github-actions[bot]@users.noreply.github.com>
-Date: Tue, 16 Jul 2024 18:40:09 +0000
+Date: Sat, 2 Nov 2024 09:25:54 +0000
 Subject: [PATCH] Add APFS driver
 
 ---
  fs/apfs/Makefile                    |   23 +
- fs/apfs/apfs.h                      | 1180 ++++++++++
+ fs/apfs/apfs.h                      | 1191 ++++++++++
  fs/apfs/apfs_raw.h                  | 1562 +++++++++++++
  fs/apfs/btree.c                     | 1174 ++++++++++
  fs/apfs/compress.c                  |  474 ++++
  fs/apfs/dir.c                       | 1544 +++++++++++++
- fs/apfs/extents.c                   | 2392 ++++++++++++++++++++
+ fs/apfs/extents.c                   | 2390 ++++++++++++++++++++
  fs/apfs/file.c                      |  220 ++
- fs/apfs/inode.c                     | 2569 ++++++++++++++++++++++
+ fs/apfs/inode.c                     | 2597 ++++++++++++++++++++++
  fs/apfs/key.c                       |  334 +++
- fs/apfs/libzbitmap.c                |  444 ++++
+ fs/apfs/libzbitmap.c                |  442 ++++
  fs/apfs/libzbitmap.h                |   31 +
  fs/apfs/lzfse/lzfse.h               |  136 ++
  fs/apfs/lzfse/lzfse_decode.c        |   74 +
@@ -37,16 +37,16 @@ Subject: [PATCH] Add APFS driver
  fs/apfs/node.c                      | 2069 ++++++++++++++++++
  fs/apfs/object.c                    |  315 +++
  fs/apfs/snapshot.c                  |  681 ++++++
- fs/apfs/spaceman.c                  | 1305 +++++++++++
- fs/apfs/super.c                     | 1795 +++++++++++++++
+ fs/apfs/spaceman.c                  | 1433 ++++++++++++
+ fs/apfs/super.c                     | 1955 +++++++++++++++++
  fs/apfs/symlink.c                   |   80 +
- fs/apfs/transaction.c               |  976 +++++++++
- fs/apfs/unicode.c                   | 3157 +++++++++++++++++++++++++++
+ fs/apfs/transaction.c               |  988 +++++++++
+ fs/apfs/unicode.c                   | 3156 +++++++++++++++++++++++++++
  fs/apfs/unicode.h                   |   27 +
  fs/apfs/version.h                   |    1 +
  fs/apfs/xattr.c                     |  922 ++++++++
  fs/apfs/xfield.c                    |  171 ++
- 41 files changed, 29015 insertions(+)
+ 41 files changed, 29349 insertions(+)
  create mode 100644 fs/apfs/Makefile
  create mode 100644 fs/apfs/apfs.h
  create mode 100644 fs/apfs/apfs_raw.h
@@ -120,10 +120,10 @@ index 000000000..ab4c49d55
 +	make -C $(KERNEL_DIR) M=$(PWD) clean
 diff --git a/fs/apfs/apfs.h b/fs/apfs/apfs.h
 new file mode 100644
-index 000000000..f09b3f6a5
+index 000000000..44d6905f9
 --- /dev/null
 +++ b/fs/apfs/apfs.h
-@@ -0,0 +1,1180 @@
+@@ -0,0 +1,1191 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +/*
 + * Copyright (C) 2018 Ernesto A. Fernández <ernesto.mnd.fernandez@gmail.com>
@@ -243,6 +243,11 @@ index 000000000..f09b3f6a5
 +	return (node->flags & APFS_BTNODE_FIXED_KV_SIZE) != 0;
 +}
 +
++struct apfs_ip_bitmap_block_info {
++	bool	dirty;		/* Do we need to commit this block to disk? */
++	void	*block;		/* In-memory address of the bitmap block */
++};
++
 +/*
 + * Space manager data in memory.
 + */
@@ -273,7 +278,7 @@ index 000000000..f09b3f6a5
 +	/* Number of ip bitmaps */
 +	u32 sm_ip_bmaps_count;
 +	/* List of ip bitmaps, in order */
-+	struct buffer_head *sm_ip_bmaps[];
++	struct apfs_ip_bitmap_block_info sm_ip_bmaps[];
 +};
 +
 +#define APFS_TRANS_MAIN_QUEUE_MAX	10000
@@ -343,6 +348,11 @@ index 000000000..f09b3f6a5
 +/* Mount option flags for a container */
 +#define APFS_CHECK_NODES	1
 +#define APFS_READWRITE		2
++/*
++ * Mount options for a container are decided on its first mount. This flag lets
++ * future mounts know that has happened already.
++ */
++#define APFS_FLAGS_SET		4
 +
 +/*
 + * Container superblock data in memory
@@ -1187,6 +1197,7 @@ index 000000000..f09b3f6a5
 +extern int apfs_free_queue_insert_nocache(struct super_block *sb, u64 bno, u64 count);
 +extern int apfs_free_queue_insert(struct super_block *sb, u64 bno, u64 count);
 +extern int apfs_spaceman_allocate_block(struct super_block *sb, u64 *bno, bool backwards);
++extern int apfs_write_ip_bitmaps(struct super_block *sb);
 +
 +/* super.c */
 +extern int apfs_map_volume_super_bno(struct super_block *sb, u64 bno, bool check);
@@ -6084,10 +6095,10 @@ index 000000000..416f42f02
 +}
 diff --git a/fs/apfs/extents.c b/fs/apfs/extents.c
 new file mode 100644
-index 000000000..c8ae4092a
+index 000000000..318d97b85
 --- /dev/null
 +++ b/fs/apfs/extents.c
-@@ -0,0 +1,2392 @@
+@@ -0,0 +1,2390 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Copyright (C) 2018 Ernesto A. Fernández <ernesto.mnd.fernandez@gmail.com>
@@ -6097,8 +6108,6 @@ index 000000000..c8ae4092a
 +#include <linux/slab.h>
 +#include <linux/blk_types.h>
 +#include "apfs.h"
-+
-+#define MAX(X, Y)	((X) <= (Y) ? (Y) : (X))
 +
 +/**
 + * apfs_ext_is_hole - Does this extent represent a hole in a sparse file?
@@ -8063,7 +8072,7 @@ index 000000000..c8ae4092a
 +	prev_end = prev_ext.bno + prev_ext.blkcount;
 +	if (prev_end < *paddr_end) {
 +		/* The extent to put is part of a snapshot */
-+		tmp.phys_block_num = MAX(prev_end, paddr_min);
++		tmp.phys_block_num = max(prev_end, paddr_min);
 +		tmp.len = (*paddr_end - tmp.phys_block_num) << sb->s_blocksize_bits;
 +		ret = apfs_create_update_pext(query, &tmp, -1);
 +		*paddr_end = tmp.phys_block_num;
@@ -8203,7 +8212,7 @@ index 000000000..c8ae4092a
 +	prev_end = prev_ext.bno + prev_ext.blkcount;
 +	if (prev_end < *paddr_end) {
 +		/* The extent to take is part of a snapshot */
-+		tmp.phys_block_num = MAX(prev_end, paddr_min);
++		tmp.phys_block_num = max(prev_end, paddr_min);
 +		tmp.len = (*paddr_end - tmp.phys_block_num) << sb->s_blocksize_bits;
 +		ret = apfs_create_update_pext(query, &tmp, +1);
 +		*paddr_end = tmp.phys_block_num;
@@ -8708,10 +8717,10 @@ index 000000000..c37d59a02
 +};
 diff --git a/fs/apfs/inode.c b/fs/apfs/inode.c
 new file mode 100644
-index 000000000..71a1dca38
+index 000000000..96129a452
 --- /dev/null
 +++ b/fs/apfs/inode.c
-@@ -0,0 +1,2569 @@
+@@ -0,0 +1,2597 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Copyright (C) 2018 Ernesto A. Fernández <ernesto.mnd.fernandez@gmail.com>
@@ -9279,7 +9288,11 @@ index 000000000..71a1dca38
 +		}
 +	}
 +
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
++	err = __block_write_begin(page_folio(page), pos, len, apfs_get_new_block);
++#else
 +	err = __block_write_begin(page, pos, len, apfs_get_new_block);
++#endif
 +	if (err) {
 +		apfs_err(sb, "CoW failed in inode 0x%llx", apfs_ino(inode));
 +		goto out_put_page;
@@ -9294,7 +9307,11 @@ index 000000000..71a1dca38
 +	return err;
 +}
 +
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
++static int apfs_write_begin(struct file *file, struct address_space *mapping,
++			    loff_t pos, unsigned int len,
++			    struct folio **foliop, void **fsdata)
++#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
 +static int apfs_write_begin(struct file *file, struct address_space *mapping,
 +			    loff_t pos, unsigned int len,
 +			    struct page **pagep, void **fsdata)
@@ -9306,6 +9323,10 @@ index 000000000..71a1dca38
 +{
 +	struct inode *inode = mapping->host;
 +	struct super_block *sb = inode->i_sb;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
++	struct page *page = NULL;
++	struct page **pagep = &page;
++#endif
 +	int blkcount = (len + sb->s_blocksize - 1) >> inode->i_blkbits;
 +	struct apfs_max_ops maxops;
 +	int err;
@@ -9329,6 +9350,9 @@ index 000000000..71a1dca38
 +	err = __apfs_write_begin(file, mapping, pos, len, flags, pagep, fsdata);
 +	if (err)
 +		goto fail;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
++	*foliop = page_folio(page);
++#endif
 +	return 0;
 +
 +fail:
@@ -9342,7 +9366,11 @@ index 000000000..71a1dca38
 +	struct apfs_dstream_info *dstream = &APFS_I(inode)->i_dstream;
 +	int ret, err;
 +
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
++	ret = generic_write_end(file, mapping, pos, len, copied, page_folio(page), fsdata);
++#else
 +	ret = generic_write_end(file, mapping, pos, len, copied, page, fsdata);
++#endif
 +	dstream->ds_size = i_size_read(inode);
 +	if (ret < len && pos + len > inode->i_size) {
 +		truncate_pagecache(inode, inode->i_size);
@@ -9355,13 +9383,22 @@ index 000000000..71a1dca38
 +	return ret;
 +}
 +
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
++static int apfs_write_end(struct file *file, struct address_space *mapping,
++			  loff_t pos, unsigned int len, unsigned int copied,
++			  struct folio *folio, void *fsdata)
++#else
 +static int apfs_write_end(struct file *file, struct address_space *mapping,
 +			  loff_t pos, unsigned int len, unsigned int copied,
 +			  struct page *page, void *fsdata)
++#endif
 +{
 +	struct inode *inode = mapping->host;
 +	struct super_block *sb = inode->i_sb;
 +	struct apfs_nx_transaction *trans = &APFS_NXI(sb)->nx_transaction;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
++	struct page *page = &folio->page;
++#endif
 +	int ret, err;
 +
 +	ret = __apfs_write_end(file, mapping, pos, len, copied, page, fsdata);
@@ -9407,9 +9444,9 @@ index 000000000..71a1dca38
 +#endif
 +
 +#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-+	.readahead      = apfs_readahead,
++	.readahead	= apfs_readahead,
 +#else
-+	.readpages      = apfs_readpages,
++	.readpages	= apfs_readpages,
 +#endif
 +
 +	.write_begin	= apfs_write_begin,
@@ -11623,10 +11660,10 @@ index 000000000..eb38cd2c1
 +}
 diff --git a/fs/apfs/libzbitmap.c b/fs/apfs/libzbitmap.c
 new file mode 100644
-index 000000000..74799d8b1
+index 000000000..a46cfdbde
 --- /dev/null
 +++ b/fs/apfs/libzbitmap.c
-@@ -0,0 +1,444 @@
+@@ -0,0 +1,442 @@
 +// SPDX-License-Identifier: GPL-2.0+ OR MIT
 +/*
 + * Copyright (C) 2022 Corellium LLC
@@ -11640,8 +11677,6 @@ index 000000000..74799d8b1
 +#include <linux/errno.h>
 +#include <linux/string.h>
 +#include "libzbitmap.h"
-+
-+#define MIN(x, y)   ((x) > (y) ? (y) : (x))
 +
 +#define ZBM_MAGIC       "ZBM\x09"
 +#define ZBM_MAGIC_SZ    4
@@ -20864,10 +20899,10 @@ index 000000000..c9de8a155
 +}
 diff --git a/fs/apfs/spaceman.c b/fs/apfs/spaceman.c
 new file mode 100644
-index 000000000..b8d4b05f5
+index 000000000..7667f8733
 --- /dev/null
 +++ b/fs/apfs/spaceman.c
-@@ -0,0 +1,1305 @@
+@@ -0,0 +1,1433 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Copyright (C) 2019 Ernesto A. Fernández <ernesto.mnd.fernandez@gmail.com>
@@ -21005,84 +21040,147 @@ index 000000000..b8d4b05f5
 +}
 +
 +/**
-+ * apfs_ip_bm_is_free - Check if a given ip bitmap is in the free range
-+ * @sm:		on-disk spaceman structure
-+ * @index:	offset in the ring buffer of the bitmap block to check
-+ */
-+static bool apfs_ip_bm_is_free(struct apfs_spaceman_phys *sm, u16 index)
-+{
-+	u16 free_head = le16_to_cpu(sm->sm_ip_bm_free_head);
-+	u16 free_tail = le16_to_cpu(sm->sm_ip_bm_free_tail);
-+	u16 free_len, index_in_free;
-+	u16 bmap_count = le32_to_cpu(sm->sm_ip_bm_block_count);
-+
-+	free_len = (bmap_count + free_tail - free_head) % bmap_count;
-+	index_in_free = (bmap_count + index - free_head) % bmap_count;
-+
-+	return index_in_free < free_len;
-+}
-+
-+/**
-+ * apfs_update_ip_bm_free_next - Update free_next for the internal pool
-+ * @sb: superblock structure
++ * apfs_allocate_ip_bitmap - Allocate a free ip bitmap block
++ * @sb:		filesystem superblock
++ * @offset_p:	on return, the offset from sm_ip_bm_base of the allocated block
 + *
-+ * Uses the head and tail reported by the on-disk spaceman structure. Returns 0
-+ * on success, or -EFSCORRUPTED if corruption is detected.
++ * Returns 0 on success or a negative error code in case of failure.
 + */
-+static int apfs_update_ip_bm_free_next(struct super_block *sb)
++static int apfs_allocate_ip_bitmap(struct super_block *sb, u16 *offset_p)
 +{
-+	struct apfs_spaceman *spaceman = APFS_SM(sb);
-+	struct apfs_spaceman_phys *raw = spaceman->sm_raw;
-+	u32 free_next_off = le32_to_cpu(raw->sm_ip_bm_free_next_offset);
-+	int bmap_count = le32_to_cpu(raw->sm_ip_bm_block_count); /* TODO: this can overflow! */
-+	__le16 *free_next;
-+	int i;
++	struct apfs_spaceman *spaceman = NULL;
++	struct apfs_spaceman_phys *sm_raw = NULL;
++	u32 free_next_offset, old_head_off;
++	u16 free_head, blkcnt;
++	__le16 *old_head_p = NULL;
 +
-+	if (free_next_off > spaceman->sm_size) {
-+		apfs_err(sb, "offset out of bounds (%u)", free_next_off);
++	spaceman = APFS_SM(sb);
++	sm_raw = spaceman->sm_raw;
++	free_next_offset = le32_to_cpu(sm_raw->sm_ip_bm_free_next_offset);
++	free_head = le16_to_cpu(sm_raw->sm_ip_bm_free_head);
++	blkcnt = (u16)le32_to_cpu(sm_raw->sm_ip_bm_block_count);
++
++	/*
++	 * The "free_next" array is a linked list of free blocks that starts
++	 * with the "free_head". Allocate this head then, and make the next
++	 * block into the new head.
++	 */
++	old_head_off = free_next_offset + free_head * sizeof(*old_head_p);
++	old_head_p = apfs_spaceman_get_16(sb, old_head_off);
++	if (!old_head_p) {
++		apfs_err(sb, "free_next head offset out of bounds (%u)", old_head_off);
 +		return -EFSCORRUPTED;
 +	}
-+	if (free_next_off + bmap_count * sizeof(*free_next) > spaceman->sm_size) {
-+		apfs_err(sb, "free next out of bounds (%u-%u)", free_next_off, bmap_count * (u32)sizeof(*free_next));
++	*offset_p = free_head;
++	free_head = le16_to_cpup(old_head_p);
++	sm_raw->sm_ip_bm_free_head = *old_head_p;
++	/* No longer free, no longer part of the linked list */
++	*old_head_p = cpu_to_le16(APFS_SPACEMAN_IP_BM_INDEX_INVALID);
++
++	/* Just a little sanity check because I've messed this up before */
++	if (free_head >= blkcnt || *offset_p >= blkcnt) {
++		apfs_err(sb, "free next list seems empty or corrupt");
 +		return -EFSCORRUPTED;
 +	}
-+	free_next = (void *)raw + free_next_off;
 +
-+	for (i = 0; i < bmap_count; ++i) {
-+		if (apfs_ip_bm_is_free(raw, i))
-+			free_next[i] = cpu_to_le16((1 + i) % bmap_count);
-+		else
-+			free_next[i] = cpu_to_le16(0xFFFF);
-+	}
 +	return 0;
 +}
 +
 +/**
-+ * apfs_rotate_single_ip_bitmap - Reallocate an ip bmap in the circular buffer
++ * apfs_free_ip_bitmap - Free a used ip bitmap block
 + * @sb:		filesystem superblock
-+ * @idx:	index of the ip bitmap to reallocate
++ * @offset:	the offset from sm_ip_bm_base of the block to free
 + *
 + * Returns 0 on success or a negative error code in case of failure.
 + */
-+static int apfs_rotate_single_ip_bitmap(struct super_block *sb, u32 idx)
++static int apfs_free_ip_bitmap(struct super_block *sb, u16 offset)
++{
++	struct apfs_spaceman *spaceman = NULL;
++	struct apfs_spaceman_phys *sm_raw = NULL;
++	u32 free_next_offset, old_tail_off;
++	u16 free_tail;
++	__le16 *old_tail_p = NULL;
++
++	spaceman = APFS_SM(sb);
++	sm_raw = spaceman->sm_raw;
++	free_next_offset = le32_to_cpu(sm_raw->sm_ip_bm_free_next_offset);
++	free_tail = le16_to_cpu(sm_raw->sm_ip_bm_free_tail);
++
++	/*
++	 * The "free_next" array is a linked list of free blocks that ends
++	 * with the "free_tail". The block getting freed will become the new
++	 * tail of the list.
++	 */
++	old_tail_off = free_next_offset + free_tail * sizeof(*old_tail_p);
++	old_tail_p = apfs_spaceman_get_16(sb, old_tail_off);
++	if (!old_tail_p) {
++		apfs_err(sb, "free_next tail offset out of bounds (%u)", old_tail_off);
++		return -EFSCORRUPTED;
++	}
++	*old_tail_p = cpu_to_le16(offset);
++	sm_raw->sm_ip_bm_free_tail = cpu_to_le16(offset);
++	free_tail = offset;
++
++	return 0;
++}
++
++/**
++ * apfs_reallocate_ip_bitmap - Find a new block for an ip bitmap
++ * @sb:		filesystem superblock
++ * @offset_p:	the offset from sm_ip_bm_base of the block to free
++ *
++ * On success returns 0 and updates @offset_p to the new offset allocated for
++ * the ip bitmap. Since blocks are allocated at the head of the list and freed
++ * at the tail, there is no risk of reuse by future reallocations within the
++ * same transaction (under there is some serious corruption, of course).
++ *
++ * Returns a negative error code in case of failure.
++ */
++static int apfs_reallocate_ip_bitmap(struct super_block *sb, __le16 *offset_p)
++{
++	int err;
++	u16 offset;
++
++	offset = le16_to_cpup(offset_p);
++
++	err = apfs_free_ip_bitmap(sb, offset);
++	if (err) {
++		apfs_err(sb, "failed to free ip bitmap %u", offset);
++		return err;
++	}
++	err = apfs_allocate_ip_bitmap(sb, &offset);
++	if (err) {
++		apfs_err(sb, "failed to allocate a new ip bitmap block");
++		return err;
++	}
++
++	*offset_p = cpu_to_le16(offset);
++	return 0;
++}
++
++/**
++ * apfs_write_single_ip_bitmap - Write a single ip bitmap to disk
++ * @sb:		filesystem superblock
++ * @bitmap:	bitmap to write
++ * @idx:	index of the ip bitmap to write
++ *
++ * Returns 0 on success or a negative error code in case of failure.
++ */
++static int apfs_write_single_ip_bitmap(struct super_block *sb, char *bitmap, u32 idx)
 +{
 +	struct apfs_nxsb_info *nxi = APFS_NXI(sb);
 +	struct apfs_spaceman *spaceman = APFS_SM(sb);
 +	struct apfs_spaceman_phys *sm_raw = spaceman->sm_raw;
-+	struct buffer_head *old_bh = NULL, *new_bh = NULL;
-+	u64 ring_base;
-+	u32 ring_length;
++	struct buffer_head *bh = NULL;
++	u64 ip_bm_base, ip_bitmap_bno;
 +	u32 xid_off, ip_bitmap_off;
-+	u64 ip_bitmap_bno;
-+	u16 free_head;
 +	__le64 *xid_p = NULL;
 +	__le16 *ip_bitmap_p = NULL;
 +	int err;
 +
-+	ring_base = le64_to_cpu(sm_raw->sm_ip_bm_base);
-+	ring_length = le32_to_cpu(sm_raw->sm_ip_bm_block_count);
-+	free_head = le16_to_cpu(sm_raw->sm_ip_bm_free_head);
++	ip_bm_base = le64_to_cpu(sm_raw->sm_ip_bm_base);
 +
++	/* First update the xid, which is kept in a separate array */
 +	xid_off = le32_to_cpu(sm_raw->sm_ip_bm_xid_offset) + idx * sizeof(*xid_p);
 +	xid_p = apfs_spaceman_get_64(sb, xid_off);
 +	if (!xid_p) {
@@ -21091,6 +21189,91 @@ index 000000000..b8d4b05f5
 +	}
 +	*xid_p = cpu_to_le64(nxi->nx_xid);
 +
++	/* Now get find new location for the ip bitmap (and free the old one) */
++	ip_bitmap_off = le32_to_cpu(sm_raw->sm_ip_bitmap_offset) + idx * sizeof(*ip_bitmap_p);
++	ip_bitmap_p = apfs_spaceman_get_16(sb, ip_bitmap_off);
++	if (!ip_bitmap_p) {
++		apfs_err(sb, "bmap offset out of bounds (%u)", ip_bitmap_off);
++		return -EFSCORRUPTED;
++	}
++	err = apfs_reallocate_ip_bitmap(sb, ip_bitmap_p);
++	if (err) {
++		apfs_err(sb, "failed to reallocate ip bitmap %u", le16_to_cpup(ip_bitmap_p));
++		return err;
++	}
++
++	/* Finally, write the dirty bitmap to the new location */
++	ip_bitmap_bno = ip_bm_base + le16_to_cpup(ip_bitmap_p);
++	bh = apfs_getblk(sb, ip_bitmap_bno);
++	if (!bh) {
++		apfs_err(sb, "failed to map block for CoW (0x%llx)", ip_bitmap_bno);
++		return -EIO;
++	}
++	memcpy(bh->b_data, bitmap, sb->s_blocksize);
++	err = apfs_transaction_join(sb, bh);
++	if (err)
++		goto fail;
++	bh = NULL;
++
++	spaceman->sm_ip_bmaps[idx].dirty = false;
++	return 0;
++
++fail:
++	brelse(bh);
++	bh = NULL;
++	return err;
++}
++
++/**
++ * apfs_write_ip_bitmaps - Write all dirty ip bitmaps to disk
++ * @sb: superblock structure
++ *
++ * Returns 0 on success or a negative error code in case of failure.
++ */
++int apfs_write_ip_bitmaps(struct super_block *sb)
++{
++	struct apfs_spaceman *spaceman = APFS_SM(sb);
++	struct apfs_spaceman_phys *sm_raw = spaceman->sm_raw;
++	struct apfs_ip_bitmap_block_info *info = NULL;
++	u32 bmaps_count = spaceman->sm_ip_bmaps_count;
++	int err;
++	u32 i;
++
++	apfs_assert_in_transaction(sb, &sm_raw->sm_o);
++
++	for (i = 0; i < bmaps_count; ++i) {
++		info = &spaceman->sm_ip_bmaps[i];
++		if (!info->dirty)
++			continue;
++		err = apfs_write_single_ip_bitmap(sb, info->block, i);
++		if (err) {
++			apfs_err(sb, "failed to rotate ip bitmap %u", i);
++			return err;
++		}
++	}
++	return 0;
++}
++
++/**
++* apfs_read_single_ip_bitmap - Read a single ip bitmap to memory
++* @sb:	filesystem superblock
++* @idx:	index of the ip bitmap to read
++*
++* Returns 0 on success or a negative error code in case of failure.
++*/
++static int apfs_read_single_ip_bitmap(struct super_block *sb, u32 idx)
++{
++	struct apfs_spaceman *spaceman = APFS_SM(sb);
++	struct apfs_spaceman_phys *sm_raw = spaceman->sm_raw;
++	struct buffer_head *bh = NULL;
++	char *bitmap = NULL;
++	u64 ip_bm_base, ip_bitmap_bno;
++	u32 ip_bitmap_off;
++	__le16 *ip_bitmap_p = NULL;
++	int err;
++
++	ip_bm_base = le64_to_cpu(sm_raw->sm_ip_bm_base);
++
 +	ip_bitmap_off = le32_to_cpu(sm_raw->sm_ip_bitmap_offset) + idx * sizeof(*ip_bitmap_p);
 +	ip_bitmap_p = apfs_spaceman_get_16(sb, ip_bitmap_off);
 +	if (!ip_bitmap_p) {
@@ -21098,92 +21281,52 @@ index 000000000..b8d4b05f5
 +		return -EFSCORRUPTED;
 +	}
 +
-+	ip_bitmap_bno = ring_base + le16_to_cpup(ip_bitmap_p);
-+	old_bh = apfs_sb_bread(sb, ip_bitmap_bno);
-+	if (!old_bh) {
-+		apfs_err(sb, "failed to read current ip bitmap (0x%llx)", ip_bitmap_bno);
-+		return -EIO;
-+	}
++	bitmap = kmalloc(sb->s_blocksize, GFP_KERNEL);
++	if (!bitmap)
++		return -ENOMEM;
 +
-+	*ip_bitmap_p = cpu_to_le16(free_head);
-+	free_head = (free_head + 1) % ring_length;
-+	sm_raw->sm_ip_bm_free_head = cpu_to_le16(free_head);
-+
-+	ip_bitmap_bno = ring_base + le16_to_cpup(ip_bitmap_p);
-+	new_bh = apfs_getblk(sb, ip_bitmap_bno);
-+	if (!new_bh) {
-+		apfs_err(sb, "failed to map block for CoW (0x%llx)", ip_bitmap_bno);
++	ip_bitmap_bno = ip_bm_base + le16_to_cpup(ip_bitmap_p);
++	bh = apfs_sb_bread(sb, ip_bitmap_bno);
++	if (!bh) {
++		apfs_err(sb, "failed to read ip bitmap (0x%llx)", ip_bitmap_bno);
 +		err = -EIO;
-+		goto out;
++		goto fail;
 +	}
-+	memcpy(new_bh->b_data, old_bh->b_data, sb->s_blocksize);
-+	err = apfs_transaction_join(sb, new_bh);
-+	if (err)
-+		goto out;
-+	spaceman->sm_ip_bmaps[idx] = new_bh;
++	memcpy(bitmap, bh->b_data, sb->s_blocksize);
++	brelse(bh);
++	bh = NULL;
 +
-+out:
-+	brelse(old_bh);
-+	if (err)
-+		brelse(new_bh);
++	spaceman->sm_ip_bmaps[idx].dirty = false;
++	spaceman->sm_ip_bmaps[idx].block = bitmap;
++	bitmap = NULL;
++	return 0;
++
++fail:
++	kfree(bitmap);
++	bitmap = NULL;
 +	return err;
 +}
 +
 +/**
-+ * apfs_rotate_ip_bitmaps - Allocate new ip bitmaps from the circular buffer
++ * apfs_read_ip_bitmaps - Read all the ip bitmaps to memory
 + * @sb: superblock structure
-+ *
-+ * Allocates bitmaps for the whole internal pool at once, meaning that each
-+ * transaction is forced to allocate one bitmap for every ~1.32 TiB of container
-+ * size, even if they won't be needed. This seems very reasonable to me, but the
-+ * official implementation avoids it and they may have a good reason.
 + *
 + * Returns 0 on success or a negative error code in case of failure.
 + */
-+static int apfs_rotate_ip_bitmaps(struct super_block *sb)
++static int apfs_read_ip_bitmaps(struct super_block *sb)
 +{
 +	struct apfs_spaceman *spaceman = APFS_SM(sb);
-+	struct apfs_spaceman_phys *sm_raw = spaceman->sm_raw;
-+	u32 ring_length = le32_to_cpu(sm_raw->sm_ip_bm_block_count);
 +	u32 bmaps_count = spaceman->sm_ip_bmaps_count;
-+	u16 free_head, free_tail, free_len;
 +	int err;
 +	u32 i;
 +
-+	apfs_assert_in_transaction(sb, &sm_raw->sm_o);
-+
-+	free_head = le16_to_cpu(sm_raw->sm_ip_bm_free_head);
-+	free_tail = le16_to_cpu(sm_raw->sm_ip_bm_free_tail);
-+
-+	/*
-+	 * Check that we have enough room before doing anything. If we run out
-+	 * I may need to compact the ring using the blocks marked as 0xFFFF in
-+	 * ip_bm_free_next (TODO).
-+	 */
-+	free_len = (ring_length + free_tail - free_head) % ring_length;
-+	if (free_len < bmaps_count) {
-+		apfs_alert(sb, "full ip bitmap ring (%u < %u)", free_len, bmaps_count);
-+		return -ENOSPC;
-+	}
-+
 +	for (i = 0; i < bmaps_count; ++i) {
-+		err = apfs_rotate_single_ip_bitmap(sb, i);
++		err = apfs_read_single_ip_bitmap(sb, i);
 +		if (err) {
-+			apfs_err(sb, "failed to rotate ip bitmap %u", i);
++			apfs_err(sb, "failed to read ip bitmap %u", i);
 +			return err;
 +		}
 +	}
-+
-+	/* All bitmaps have been reallocated, so just free the same number */
-+	free_tail = (free_tail + bmaps_count) % ring_length;
-+	sm_raw->sm_ip_bm_free_tail = cpu_to_le16(free_tail);
-+
-+	err = apfs_update_ip_bm_free_next(sb);
-+	if (err) {
-+		apfs_err(sb, "failed to update bitmap ring");
-+		return err;
-+	}
-+
 +	return 0;
 +}
 +
@@ -21253,11 +21396,12 @@ index 000000000..b8d4b05f5
 +{
 +	struct apfs_spaceman *sm = APFS_SM(sb);
 +	struct apfs_spaceman_phys *sm_raw = sm->sm_raw;
-+	struct buffer_head *bmap_bh = NULL;
++	struct apfs_ip_bitmap_block_info *info = NULL;
 +
 +	bno -= le64_to_cpu(sm_raw->sm_ip_base);
-+	bmap_bh = sm->sm_ip_bmaps[bno >> sm->sm_ip_bmaps_shift];
-+	__clear_bit_le(bno & sm->sm_ip_bmaps_mask, bmap_bh->b_data);
++	info = &sm->sm_ip_bmaps[bno >> sm->sm_ip_bmaps_shift];
++	__clear_bit_le(bno & sm->sm_ip_bmaps_mask, info->block);
++	info->dirty = true;
 +
 +	return 0;
 +}
@@ -21430,22 +21574,30 @@ index 000000000..b8d4b05f5
 +/**
 + * apfs_allocate_spaceman - Allocate an in-memory spaceman struct, if needed
 + * @sb:		superblock structure
-+ * @bmap_cnt:	internal pool bitmap count
++ * @raw:	on-disk spaceman struct
++ * @size:	size of the on-disk spaceman
 + *
-+ * Returns the spaceman and sets it in the superblock info. Also sets the fixed
-+ * information about the ip bitmap count. On failure, returns an error pointer.
++ * Returns the spaceman and sets it in the superblock info. Also performs all
++ * initializations for the internal pool, including reading all the ip bitmaps.
++ * This is a bit out of place here, but it's convenient because it has to
++ * happen only once.
++ *
++ * On failure, returns an error pointer.
 + */
-+static struct apfs_spaceman *apfs_allocate_spaceman(struct super_block *sb, u32 bmap_cnt)
++static struct apfs_spaceman *apfs_allocate_spaceman(struct super_block *sb, struct apfs_spaceman_phys *raw, u32 size)
 +{
 +	struct apfs_nxsb_info *nxi = APFS_NXI(sb);
 +	struct apfs_spaceman *spaceman = NULL;
 +	int blk_bitcnt = sb->s_blocksize * 8;
 +	size_t sm_size;
++	u32 bmap_cnt;
++	int err;
 +
 +	if (nxi->nx_spaceman)
 +		return nxi->nx_spaceman;
 +
 +	/* We don't expect filesystems this big, it would be like 260 TiB */
++	bmap_cnt = le32_to_cpu(raw->sm_ip_bm_size_in_blocks);
 +	if (bmap_cnt > 200) {
 +		apfs_err(sb, "too many ip bitmap blocks (%u)", bmap_cnt);
 +		return ERR_PTR(-EFSCORRUPTED);
@@ -21456,11 +21608,28 @@ index 000000000..b8d4b05f5
 +	if (!spaceman)
 +		return ERR_PTR(-ENOMEM);
 +	spaceman->sm_nxi = nxi;
++	/*
++	 * These two fields must be set before reading the ip bitmaps, since
++	 * that stuff involves several variable-length arrays inside the
++	 * spaceman object itself.
++	 */
++	spaceman->sm_raw = raw;
++	spaceman->sm_size = size;
 +
 +	spaceman->sm_ip_bmaps_count = bmap_cnt;
 +	spaceman->sm_ip_bmaps_mask = blk_bitcnt - 1;
 +	spaceman->sm_ip_bmaps_shift = order_base_2(blk_bitcnt);
-+	return spaceman;
++
++	/* This must happen only once, so it's easier to just leave it here */
++	err = apfs_read_ip_bitmaps(sb);
++	if (err) {
++		apfs_err(sb, "failed to read the ip bitmaps");
++		kfree(spaceman);
++		nxi->nx_spaceman = spaceman = NULL;
++		return ERR_PTR(err);
++	}
++
++	return nxi->nx_spaceman;
 +}
 +
 +/**
@@ -21493,14 +21662,12 @@ index 000000000..b8d4b05f5
 +	sm_raw = (struct apfs_spaceman_phys *)sm_eph_info->object;
 +	sm_raw->sm_o.o_xid = cpu_to_le64(nxi->nx_xid);
 +
-+	spaceman = apfs_allocate_spaceman(sb, le32_to_cpu(sm_raw->sm_ip_bm_size_in_blocks));
++	spaceman = apfs_allocate_spaceman(sb, sm_raw, sm_eph_info->size);
 +	if (IS_ERR(spaceman)) {
 +		apfs_err(sb, "failed to allocate spaceman");
 +		err = PTR_ERR(spaceman);
 +		goto fail;
 +	}
-+	spaceman->sm_raw = sm_raw;
-+	spaceman->sm_size = sm_eph_info->size;
 +
 +	spaceman->sm_free_cache_base = spaceman->sm_free_cache_blkcnt = 0;
 +
@@ -21525,11 +21692,6 @@ index 000000000..b8d4b05f5
 +		goto fail;
 +	}
 +
-+	err = apfs_rotate_ip_bitmaps(sb);
-+	if (err) {
-+		apfs_err(sb, "failed to rotate ip bitmaps");
-+		goto fail;
-+	}
 +	err = apfs_flush_free_queue(sb, APFS_SFQ_IP, false /* force */);
 +	if (err) {
 +		apfs_err(sb, "failed to flush ip fq");
@@ -21581,7 +21743,7 @@ index 000000000..b8d4b05f5
 +	u32 i;
 +
 +	for (i = 0; i < sm->sm_ip_bmaps_count; ++i) {
-+		char *bitmap = sm->sm_ip_bmaps[i]->b_data;
++		char *bitmap = sm->sm_ip_bmaps[i].block;
 +		u64 off_in_bmap_blk, off_in_ip;
 +
 +		off_in_bmap_blk = find_next_zero_bit_le(bitmap, blk_bitcnt, 0 /* offset */);
@@ -21626,11 +21788,12 @@ index 000000000..b8d4b05f5
 +{
 +	struct apfs_spaceman *sm = APFS_SM(sb);
 +	struct apfs_spaceman_phys *sm_raw = sm->sm_raw;
-+	struct buffer_head *bmap_bh = NULL;
++	struct apfs_ip_bitmap_block_info *info = NULL;
 +
 +	bno -= le64_to_cpu(sm_raw->sm_ip_base);
-+	bmap_bh = sm->sm_ip_bmaps[bno >> sm->sm_ip_bmaps_shift];
-+	__set_bit_le(bno & sm->sm_ip_bmaps_mask, bmap_bh->b_data);
++	info = &sm->sm_ip_bmaps[bno >> sm->sm_ip_bmaps_shift];
++	__set_bit_le(bno & sm->sm_ip_bmaps_mask, info->block);
++	info->dirty = true;
 +}
 +
 +/**
@@ -22175,10 +22338,10 @@ index 000000000..b8d4b05f5
 +}
 diff --git a/fs/apfs/super.c b/fs/apfs/super.c
 new file mode 100644
-index 000000000..993e9a000
+index 000000000..2d3a5df93
 --- /dev/null
 +++ b/fs/apfs/super.c
-@@ -0,0 +1,1795 @@
+@@ -0,0 +1,1955 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Copyright (C) 2018 Ernesto A. Fernández <ernesto.mnd.fernandez@gmail.com>
@@ -22204,8 +22367,26 @@ index 000000000..993e9a000
 +#endif
 +
 +/* Keep a list of mounted containers, so that their volumes can share them */
-+DEFINE_MUTEX(nxs_mutex);
 +static LIST_HEAD(nxs);
++/*
++ * The main purpose of this mutex is to protect the list of containers and
++ * their reference counts, but it also has other uses during mounts/unmounts:
++ *   - it prevents new mounts from starting while an unmount is updating the
++ *     backup superblock (apfs_attach_nxi vs apfs_make_super_copy)
++ *   - it prevents a new container superblock read from starting while another
++ *     is taking place, which could cause leaks and other issues if both
++ *     containers are the same (apfs_read_main_super vs itself)
++ *   - it protects the list of volumes for each container, and keeps it
++ *     consistent with the reference count
++ *   - it prevents two different snapshots for a single volume from trying to
++ *     do the first read of their shared omap at the same time
++ *     (apfs_first_read_omap vs itself)
++ *   - it protects the reference count for that shared omap, keeping it
++ *     consistent with the number of volumes that are set with that omap
++ *   - it protects the container mount flags, so that they can only be set by
++ *     the first volume mount to attempt it (apfs_set_nx_flags vs itself)
++ */
++DEFINE_MUTEX(nxs_mutex);
 +
 +/**
 + * apfs_nx_find_by_dev - Search for a device in the list of mounted containers
@@ -22320,7 +22501,11 @@ index 000000000..993e9a000
 +	if (!(nxi->nx_flags & APFS_READWRITE))
 +		return;
 +
-+	/* Only update the backup once all volumes are unmounted */
++	/*
++	 * Only update the backup when the last volume is getting unmounted.
++	 * Of course a new mounter could still come along before we actually
++	 * release the nxi.
++	 */
 +	mutex_lock(&nxs_mutex);
 +	if (nxi->nx_refcnt > 1)
 +		goto out_unlock;
@@ -22338,6 +22523,7 @@ index 000000000..993e9a000
 +}
 +
 +static int apfs_check_nx_features(struct super_block *sb);
++static void apfs_set_trans_buffer_limit(struct super_block *sb);
 +
 +/**
 + * apfs_read_main_super - Find the container superblock and read it into memory
@@ -22349,7 +22535,7 @@ index 000000000..993e9a000
 +static int apfs_read_main_super(struct super_block *sb)
 +{
 +	struct apfs_nxsb_info *nxi = APFS_NXI(sb);
-+	struct buffer_head *bh;
++	struct buffer_head *bh = NULL;
 +	struct buffer_head *desc_bh = NULL;
 +	struct apfs_nx_superblock *msb_raw;
 +	u64 xid, bno = APFS_NX_BLOCK_NUM;
@@ -22358,19 +22544,24 @@ index 000000000..993e9a000
 +	int err = -EINVAL;
 +	int i;
 +
-+	lockdep_assert_held(&nxs_mutex);
-+	if (nxi->nx_refcnt > 1) {
++	mutex_lock(&nxs_mutex);
++
++	if (nxi->nx_blocksize) {
 +		/* It's already mapped */
 +		sb->s_blocksize = nxi->nx_blocksize;
 +		sb->s_blocksize_bits = nxi->nx_blocksize_bits;
 +		sb->s_magic = le32_to_cpu(nxi->nx_raw->nx_magic);
-+		return 0;
++		err = 0;
++		goto out;
 +	}
 +
 +	/* Read the superblock from the last clean unmount */
 +	bh = apfs_read_super_copy(sb);
-+	if (IS_ERR(bh))
-+		return PTR_ERR(bh);
++	if (IS_ERR(bh)) {
++		err = PTR_ERR(bh);
++		bh = NULL;
++		goto out;
++	}
 +	msb_raw = (struct apfs_nx_superblock *)bh->b_data;
 +
 +	/* We want to mount the latest valid checkpoint among the descriptors */
@@ -22378,13 +22569,13 @@ index 000000000..993e9a000
 +	if (desc_base >> 63 != 0) {
 +		/* The highest bit is set when checkpoints are not contiguous */
 +		apfs_err(sb, "checkpoint descriptor tree not yet supported");
-+		goto fail;
++		goto out;
 +	}
 +	desc_blocks = le32_to_cpu(msb_raw->nx_xp_desc_blocks);
 +	if (desc_blocks > 10000) { /* Arbitrary loop limit, is it enough? */
 +		apfs_err(sb, "too many checkpoint descriptors?");
 +		err = -EFSCORRUPTED;
-+		goto fail;
++		goto out;
 +	}
 +
 +	/* Now we go through the checkpoints one by one */
@@ -22396,7 +22587,7 @@ index 000000000..993e9a000
 +		desc_bh = apfs_sb_bread(sb, desc_base + i);
 +		if (!desc_bh) {
 +			apfs_err(sb, "unable to read checkpoint descriptor");
-+			goto fail;
++			goto out;
 +		}
 +		desc_raw = (struct apfs_nx_superblock *)desc_bh->b_data;
 +
@@ -22418,7 +22609,7 @@ index 000000000..993e9a000
 +	nxi->nx_raw = kmalloc(sb->s_blocksize, GFP_KERNEL);
 +	if (!nxi->nx_raw) {
 +		err = -ENOMEM;
-+		goto fail;
++		goto out;
 +	}
 +	memcpy(nxi->nx_raw, bh->b_data, sb->s_blocksize);
 +	nxi->nx_bno = bno;
@@ -22427,10 +22618,12 @@ index 000000000..993e9a000
 +	/* For now we only support blocksize < PAGE_SIZE */
 +	nxi->nx_blocksize = sb->s_blocksize;
 +	nxi->nx_blocksize_bits = sb->s_blocksize_bits;
++	apfs_set_trans_buffer_limit(sb);
 +
 +	err = apfs_check_nx_features(sb);
-+fail:
++out:
 +	brelse(bh);
++	mutex_unlock(&nxs_mutex);
 +	return err;
 +}
 +
@@ -22474,6 +22667,8 @@ index 000000000..993e9a000
 +	fmode_t mode = FMODE_READ | FMODE_EXCL;
 +#endif
 +	struct apfs_ephemeral_object_info *eph_list = NULL;
++	struct apfs_spaceman *sm = NULL;
++	u32 bmap_idx;
 +	int i;
 +
 +#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
@@ -22481,7 +22676,7 @@ index 000000000..993e9a000
 +		mode |= FMODE_WRITE;
 +#endif
 +
-+	lockdep_assert_held(&nxs_mutex);
++	mutex_lock(&nxs_mutex);
 +
 +	list_del(&sbi->list);
 +	if (--nxi->nx_refcnt)
@@ -22513,11 +22708,19 @@ index 000000000..993e9a000
 +#endif
 +
 +	list_del(&nxi->nx_list);
-+	kfree(nxi->nx_spaceman);
-+	nxi->nx_spaceman = NULL;
++	sm = nxi->nx_spaceman;
++	if (sm) {
++		for (bmap_idx = 0; bmap_idx < sm->sm_ip_bmaps_count; ++bmap_idx) {
++			kfree(sm->sm_ip_bmaps[bmap_idx].block);
++			sm->sm_ip_bmaps[bmap_idx].block = NULL;
++		}
++		kfree(sm);
++		nxi->nx_spaceman = sm = NULL;
++	}
 +	kfree(nxi);
 +out:
 +	sbi->s_nxi = NULL;
++	mutex_unlock(&nxs_mutex);
 +}
 +
 +/**
@@ -22568,6 +22771,24 @@ index 000000000..993e9a000
 +fail:
 +	brelse(bh);
 +	return err;
++}
++
++/**
++ * apfs_alloc_omap - Allocate and initialize an object map struct
++ *
++ * Returns the struct, or NULL in case of allocation failure.
++ */
++static struct apfs_omap *apfs_alloc_omap(void)
++{
++	struct apfs_omap *omap = NULL;
++	struct apfs_omap_cache *cache = NULL;
++
++	omap = kzalloc(sizeof(*omap), GFP_KERNEL);
++	if (!omap)
++		return NULL;
++	cache = &omap->omap_cache;
++	spin_lock_init(&cache->lock);
++	return omap;
 +}
 +
 +/**
@@ -22633,7 +22854,7 @@ index 000000000..993e9a000
 +	brelse(bh);
 +	bh = NULL;
 +
-+	omap = kzalloc(sizeof(*omap), GFP_KERNEL);
++	omap = apfs_alloc_omap();
 +	if (!omap) {
 +		apfs_node_free(vnode);
 +		return -ENOMEM;
@@ -22696,6 +22917,14 @@ index 000000000..993e9a000
 +			continue;
 +		if (curr->s_vol_nr == sbi->s_vol_nr) {
 +			omap = curr->s_omap;
++			if (!omap) {
++				/*
++				 * This volume has already gone through
++				 * apfs_attach_nxi(), but its omap is either
++				 * not yet read or already put.
++				 */
++				continue;
++			}
 +			cache = &omap->omap_cache;
 +			++omap->omap_refcnt;
 +			/* Right now the cache can't be shared like this */
@@ -22779,51 +23008,79 @@ index 000000000..993e9a000
 + */
 +static int apfs_first_read_omap(struct super_block *sb)
 +{
-+	struct apfs_sb_info *sbi = APFS_SB(sb);
++	struct apfs_sb_info *sbi = NULL;
 +	struct apfs_omap *omap = NULL;
 +	int err;
 +
-+	lockdep_assert_held(&nxs_mutex);
++	/*
++	 * For each volume, the first mount that gets here is responsible
++	 * for reading the omap. Other mounts (for other snapshots) just
++	 * go through the container's volume list to retrieve it. This results
++	 * in coarse locking as usual: with some thought it would be possible
++	 * to allow other volumes to read their own omaps at the same time,
++	 * but I don't see the point.
++	 */
++	mutex_lock(&nxs_mutex);
++
++	sbi = APFS_SB(sb);
 +
 +	/* The current transaction and all snapshots share a single omap */
 +	omap = apfs_get_omap(sb);
 +	if (omap) {
 +		sbi->s_omap = omap;
-+		return 0;
++		err = 0;
++		goto out;
 +	}
 +
-+	omap = kzalloc(sizeof(*omap), GFP_KERNEL);
-+	if (!omap)
-+		return -ENOMEM;
++	omap = apfs_alloc_omap();
++	if (!omap) {
++		err = -ENOMEM;
++		goto out;
++	}
 +
 +	sbi->s_omap = omap;
 +	err = apfs_read_omap(sb, false /* write */);
 +	if (err) {
 +		kfree(omap);
 +		sbi->s_omap = NULL;
-+		return err;
++		goto out;
 +	}
 +
 +	++omap->omap_refcnt;
-+	return 0;
++	err = 0;
++out:
++	mutex_unlock(&nxs_mutex);
++	return err;
 +}
 +
 +/**
-+ * apfs_put_omap - Release a reference to an object map
-+ * @omap: the object map
++ * apfs_unset_omap - Unset the object map in a superblock
++ * @sb: superblock structure
++ *
++ * Shrinks the omap reference, frees the omap if needed, and sets the field to
++ * NULL atomically in relation to apfs_first_read_omap(). So, no other mount
++ * can grab a new reference halfway through.
 + */
-+static void apfs_put_omap(struct apfs_omap *omap)
++static void apfs_unset_omap(struct super_block *sb)
 +{
-+	lockdep_assert_held(&nxs_mutex);
++	struct apfs_omap **omap_p = NULL;
++	struct apfs_omap *omap = NULL;
 +
++	omap_p = &APFS_SB(sb)->s_omap;
++	omap = *omap_p;
 +	if (!omap)
 +		return;
 +
++	mutex_lock(&nxs_mutex);
++
 +	if (--omap->omap_refcnt != 0)
-+		return;
++		goto out;
 +
 +	apfs_node_free(omap->omap_root);
 +	kfree(omap);
++out:
++	*omap_p = NULL;
++	mutex_unlock(&nxs_mutex);
 +}
 +
 +/**
@@ -22872,9 +23129,13 @@ index 000000000..993e9a000
 +		struct apfs_superblock *vsb_raw;
 +		struct buffer_head *vsb_bh;
 +		struct apfs_max_ops maxops = {0};
++		int err;
 +
-+		if (apfs_transaction_start(sb, maxops))
++		err = apfs_transaction_start(sb, maxops);
++		if (err) {
++			apfs_err(sb, "unmount transaction start failed (err:%d)", err);
 +			goto fail;
++		}
 +		vsb_raw = sbi->s_vsb_raw;
 +		vsb_bh = sbi->s_vobject.o_bh;
 +
@@ -22887,7 +23148,9 @@ index 000000000..993e9a000
 +
 +		/* Guarantee commit */
 +		sbi->s_nxi->nx_transaction.t_state |= APFS_NX_TRANS_FORCE_COMMIT;
-+		if (apfs_transaction_commit(sb)) {
++		err = apfs_transaction_commit(sb);
++		if (err) {
++			apfs_err(sb, "unmount transaction commit failed (err:%d)", err);
 +			apfs_transaction_abort(sb);
 +			goto fail;
 +		}
@@ -22900,25 +23163,18 @@ index 000000000..993e9a000
 +	apfs_make_super_copy(sb);
 +
 +fail:
++	/*
++	 * This is essentially the cleanup for apfs_fill_super(). It goes here
++	 * because generic_shutdown_super() only calls ->put_super() when the
++	 * root dentry has been set, that is, when apfs_fill_super() succeeded.
++	 * The rest of the mount cleanup is done directly by ->kill_sb().
++	 */
 +	iput(sbi->s_private_dir);
 +	sbi->s_private_dir = NULL;
-+
 +	apfs_node_free(sbi->s_cat_root);
++	sbi->s_cat_root = NULL;
++	apfs_unset_omap(sb);
 +	apfs_unmap_volume_super(sb);
-+
-+	mutex_lock(&nxs_mutex);
-+	apfs_put_omap(sbi->s_omap);
-+	sbi->s_omap = NULL;
-+	apfs_free_main_super(sbi);
-+	mutex_unlock(&nxs_mutex);
-+
-+	sb->s_fs_info = NULL;
-+
-+	kfree(sbi->s_snap_name);
-+	sbi->s_snap_name = NULL;
-+	if (sbi->s_dflt_pfk)
-+		kfree(sbi->s_dflt_pfk);
-+	kfree(sbi);
 +}
 +
 +static struct kmem_cache *apfs_inode_cachep;
@@ -23065,7 +23321,7 @@ index 000000000..993e9a000
 +		return PTR_ERR(vnode);
 +	}
 +
-+	omap = kzalloc(sizeof(*omap), GFP_KERNEL);
++	omap = apfs_alloc_omap();
 +	if (!omap) {
 +		err = -ENOMEM;
 +		goto fail;
@@ -23252,66 +23508,16 @@ index 000000000..993e9a000
 +{
 +	struct apfs_nxsb_info *nxi = APFS_SB(sb)->s_nxi;
 +
-+	lockdep_assert_held(&nxs_mutex);
++	mutex_lock(&nxs_mutex);
 +
-+	/* The mount flags can only be set when the container is first mounted */
-+	if (nxi->nx_refcnt == 1)
++	/* The first mount thet gets here decides the flags for its container */
++	flags |= APFS_FLAGS_SET;
++	if (!(nxi->nx_flags & APFS_FLAGS_SET))
 +		nxi->nx_flags = flags;
 +	else if (flags != nxi->nx_flags)
 +		apfs_warn(sb, "ignoring mount flags - container already mounted");
-+}
 +
-+/**
-+ * apfs_get_vol_number - Retrieve the volume number from the mount options
-+ * @options:	string of mount options
-+ *
-+ * On error, it will just return the default volume 0.
-+ */
-+static unsigned int apfs_get_vol_number(char *options)
-+{
-+	char needle[] = "vol=";
-+	char *volstr;
-+	long vol;
-+
-+	if (!options)
-+		return 0;
-+
-+	/* TODO: just parse all the options once... */
-+	volstr = strstr(options, needle);
-+	if (!volstr)
-+		return 0;
-+	volstr += sizeof(needle) - 1;
-+
-+	/* TODO: other bases? */
-+	if (kstrtol(volstr, 10, &vol) < 0)
-+		return 0;
-+	return vol;
-+}
-+
-+/**
-+ * apfs_get_snap_name - Duplicate the snapshot label from the mount options
-+ * @options:	string of mount options
-+ *
-+ * On error, it will just return the default NULL snapshot name. TODO: this is
-+ * actually a bit dangerous because a memory allocation failure might get the
-+ * same snapshot mounted twice, without a shared superblock.
-+ */
-+static char *apfs_get_snap_name(char *options)
-+{
-+	char needle[] = "snap=";
-+	char *name = NULL, *end = NULL;
-+
-+	if (!options)
-+		return NULL;
-+
-+	name = strstr(options, needle);
-+	if (!name)
-+		return NULL;
-+
-+	name += sizeof(needle) - 1;
-+	end = strchrnul(name, ',');
-+
-+	return kmemdup_nul(name, end - name, GFP_KERNEL);
++	mutex_unlock(&nxs_mutex);
 +}
 +
 +/*
@@ -23328,10 +23534,7 @@ index 000000000..993e9a000
 +	int err = 0;
 +	unsigned int nx_flags;
 +
-+	lockdep_assert_held(&nxs_mutex);
-+
 +	/* Set default values before parsing */
-+	sbi->s_vol_nr = 0;
 +	nx_flags = 0;
 +
 +	if (!options)
@@ -23379,15 +23582,8 @@ index 000000000..993e9a000
 +			}
 +			break;
 +		case Opt_vol:
-+			err = match_int(&args[0], &sbi->s_vol_nr);
-+			if (err)
-+				return err;
-+			break;
 +		case Opt_snap:
-+			kfree(sbi->s_snap_name);
-+			sbi->s_snap_name = match_strdup(&args[0]);
-+			if (!sbi->s_snap_name)
-+				return -ENOMEM;
++			/* Already read early on mount */
 +			break;
 +		default:
 +			return -EINVAL;
@@ -23599,24 +23795,31 @@ index 000000000..993e9a000
 +	struct inode *root = NULL, *priv = NULL;
 +	int err;
 +
-+	ASSERT(sbi);
-+	lockdep_assert_held(&nxs_mutex);
++	/*
++	 * This function doesn't write anything to disk, that happens later
++	 * when an actual transaction begins. So, it's not generally a problem
++	 * if other mounts for the same container fill their own supers at the
++	 * same time (the few critical sections will be protected by
++	 * nxs_mutex), nor is it a problem if other mounted volumes want to
++	 * make reads while the mount is taking place. But we definitely don't
++	 * want any writes, or else we could find ourselves reading stale
++	 * blocks after CoW, among other issues.
++	 */
++	down_read(&APFS_NXI(sb)->nx_big_sem);
 +
 +	err = apfs_setup_bdi(sb);
 +	if (err)
-+		return err;
-+
-+	apfs_set_trans_buffer_limit(sb);
++		goto failed_volume;
 +
 +	sbi->s_uid = INVALID_UID;
 +	sbi->s_gid = INVALID_GID;
 +	err = parse_options(sb, data);
 +	if (err)
-+		return err;
++		goto failed_volume;
 +
 +	err = apfs_map_volume_super(sb, false /* write */);
 +	if (err)
-+		return err;
++		goto failed_volume;
 +
 +	err = apfs_check_vol_features(sb);
 +	if (err)
@@ -23646,6 +23849,12 @@ index 000000000..993e9a000
 +	sb->s_xattr = apfs_xattr_handlers;
 +	sb->s_maxbytes = MAX_LFS_FILESIZE;
 +	sb->s_time_gran = 1; /* Nanosecond granularity */
++
++	/*
++	 * At this point everything is already set up for the inode reads,
++	 * which take care of their own locking as always.
++	 */
++	up_read(&APFS_NXI(sb)->nx_big_sem);
 +
 +	sbi->s_private_dir = apfs_iget(sb, APFS_PRIV_DIR_INO_NUM);
 +	if (IS_ERR(sbi->s_private_dir)) {
@@ -23680,12 +23889,14 @@ index 000000000..993e9a000
 +	iput(sbi->s_private_dir);
 +failed_private_dir:
 +	sbi->s_private_dir = NULL;
++	down_read(&APFS_NXI(sb)->nx_big_sem);
 +	apfs_node_free(sbi->s_cat_root);
 +failed_cat:
-+	apfs_put_omap(sbi->s_omap);
-+	sbi->s_omap = NULL;
++	apfs_unset_omap(sb);
 +failed_omap:
 +	apfs_unmap_volume_super(sb);
++failed_volume:
++	up_read(&APFS_NXI(sb)->nx_big_sem);
 +	return err;
 +}
 +
@@ -23789,11 +24000,11 @@ index 000000000..993e9a000
 +	dev_t dev = 0;
 +	int ret;
 +
-+	lockdep_assert_held(&nxs_mutex);
++	mutex_lock(&nxs_mutex);
 +
 +	ret = apfs_lookup_bdev(dev_name, &dev);
 +	if (ret)
-+		return ret;
++		goto out;
 +
 +	nxi = apfs_nx_find_by_dev(dev);
 +	if (!nxi) {
@@ -23805,14 +24016,17 @@ index 000000000..993e9a000
 +		struct block_device *bdev = NULL;
 +
 +		nxi = kzalloc(sizeof(*nxi), GFP_KERNEL);
-+		if (!nxi)
-+			return -ENOMEM;
++		if (!nxi) {
++			ret = -ENOMEM;
++			goto out;
++		}
 +
 +#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0)
 +		file = bdev_file_open_by_path(dev_name, mode, &apfs_fs_type, NULL);
 +		if (IS_ERR(file)) {
 +			kfree(nxi);
-+			return PTR_ERR(file);
++			ret = PTR_ERR(file);
++			goto out;
 +		}
 +		nxi->nx_bdev_file = file;
 +		bdev = file_bdev(file);
@@ -23820,7 +24034,8 @@ index 000000000..993e9a000
 +		handle = bdev_open_by_path(dev_name, mode, &apfs_fs_type, NULL);
 +		if (IS_ERR(handle)) {
 +			kfree(nxi);
-+			return PTR_ERR(handle);
++			ret = PTR_ERR(handle);
++			goto out;
 +		}
 +		nxi->nx_bdev_handle = handle;
 +		bdev = handle->bdev;
@@ -23831,7 +24046,8 @@ index 000000000..993e9a000
 +#endif
 +		if (IS_ERR(bdev)) {
 +			kfree(nxi);
-+			return PTR_ERR(bdev);
++			ret = PTR_ERR(bdev);
++			goto out;
 +		}
 +
 +		nxi->nx_bdev = bdev;
@@ -23844,7 +24060,75 @@ index 000000000..993e9a000
 +	list_add(&sbi->list, &nxi->vol_list);
 +	sbi->s_nxi = nxi;
 +	++nxi->nx_refcnt;
-+	return 0;
++	ret = 0;
++out:
++	mutex_unlock(&nxs_mutex);
++	return ret;
++}
++
++/**
++ * apfs_preparse_options - Parse the options used to identify a superblock
++ * @sbi:	superblock info
++ * @options:	options string to parse
++ *
++ * Returns 0 on success, or a negative error code in case of failure. Even on
++ * failure, the caller is responsible for freeing all superblock fields.
++ */
++static int apfs_preparse_options(struct apfs_sb_info *sbi, char *options)
++{
++	char *tofree = NULL;
++	char *p;
++	substring_t args[MAX_OPT_ARGS];
++	int err = 0;
++
++	/* Set default values before parsing */
++	sbi->s_vol_nr = 0;
++	sbi->s_snap_name = NULL;
++
++	if (!options)
++		return 0;
++
++	/* Later parse_options() will need the unmodified options string */
++	options = kstrdup(options, GFP_KERNEL);
++	if (!options)
++		return -ENOMEM;
++	tofree = options;
++
++	while ((p = strsep(&options, ",")) != NULL) {
++		int token;
++
++		if (!*p)
++			continue;
++		token = match_token(p, tokens, args);
++		switch (token) {
++		case Opt_vol:
++			err = match_int(&args[0], &sbi->s_vol_nr);
++			if (err)
++				goto out;
++			break;
++		case Opt_snap:
++			kfree(sbi->s_snap_name);
++			sbi->s_snap_name = match_strdup(&args[0]);
++			if (!sbi->s_snap_name) {
++				err = -ENOMEM;
++				goto out;
++			}
++			break;
++		case Opt_readwrite:
++		case Opt_cknodes:
++		case Opt_uid:
++		case Opt_gid:
++			/* Not needed for sget(), will be read later */
++			break;
++		default:
++			err = -EINVAL;
++			goto out;
++		}
++	}
++	err = 0;
++out:
++	kfree(tofree);
++	return err;
 +}
 +
 +/*
@@ -23853,7 +24137,6 @@ index 000000000..993e9a000
 +static struct dentry *apfs_mount(struct file_system_type *fs_type, int flags,
 +				 const char *dev_name, void *data)
 +{
-+	struct apfs_nxsb_info *nxi;
 +	struct super_block *sb;
 +	struct apfs_sb_info *sbi;
 +#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
@@ -23863,15 +24146,13 @@ index 000000000..993e9a000
 +#endif
 +	int error = 0;
 +
-+	mutex_lock(&nxs_mutex);
-+
 +	sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
-+	if (!sbi) {
-+		error = -ENOMEM;
-+		goto out_unlock;
-+	}
-+	sbi->s_vol_nr = apfs_get_vol_number(data);
-+	sbi->s_snap_name = apfs_get_snap_name(data);
++	if (!sbi)
++		return ERR_PTR(-ENOMEM);
++	/* Set up the fields that sget() will need to id the superblock */
++	error = apfs_preparse_options(sbi, data);
++	if (error)
++		goto out_free_sbi;
 +
 +	/* Make sure that snapshots are mounted read-only */
 +	if (sbi->s_snap_name)
@@ -23885,17 +24166,25 @@ index 000000000..993e9a000
 +	error = apfs_attach_nxi(sbi, dev_name, mode);
 +	if (error)
 +		goto out_free_sbi;
-+	nxi = sbi->s_nxi;
 +
 +	/* TODO: lockfs stuff? Btrfs doesn't seem to care */
 +	sb = sget(fs_type, apfs_test_super, apfs_set_super, flags | SB_NOSEC, sbi);
-+	if (IS_ERR(sb))
++	if (IS_ERR(sb)) {
++		error = PTR_ERR(sb);
 +		goto out_unmap_super;
++	}
++
++	/*
++	 * I'm doing something hacky with s_dev inside ->kill_sb(), so I want
++	 * to find out as soon as possible if I messed it up.
++	 */
++	WARN_ON(sb->s_dev != APFS_NXI(sb)->nx_bdev->bd_dev);
 +
 +	if (sb->s_root) {
 +		if ((flags ^ sb->s_flags) & SB_RDONLY) {
 +			error = -EBUSY;
-+			goto out_deactivate_super;
++			deactivate_locked_super(sb);
++			goto out_unmap_super;
 +		}
 +		/* Only one superblock per volume */
 +		apfs_free_main_super(sbi);
@@ -23905,39 +24194,73 @@ index 000000000..993e9a000
 +		sbi = NULL;
 +	} else {
 +		error = apfs_read_main_super(sb);
-+		if (error)
-+			goto out_deactivate_super;
++		if (error) {
++			deactivate_locked_super(sb);
++			return ERR_PTR(error);
++		}
 +#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
 +		sb->s_mode = mode;
 +#endif
 +		snprintf(sb->s_id, sizeof(sb->s_id), "%xg", sb->s_dev);
 +		error = apfs_fill_super(sb, data, flags & SB_SILENT ? 1 : 0);
-+		if (error)
-+			goto out_deactivate_super;
++		if (error) {
++			deactivate_locked_super(sb);
++			return ERR_PTR(error);
++		}
 +		sb->s_flags |= SB_ACTIVE;
 +	}
 +
-+	mutex_unlock(&nxs_mutex);
 +	return dget(sb->s_root);
 +
-+out_deactivate_super:
-+	deactivate_locked_super(sb);
 +out_unmap_super:
 +	apfs_free_main_super(sbi);
 +out_free_sbi:
 +	kfree(sbi->s_snap_name);
 +	kfree(sbi);
-+out_unlock:
-+	mutex_unlock(&nxs_mutex);
 +	return ERR_PTR(error);
++}
++
++/**
++ * apfs_free_sb_info - Free the sb info and release all remaining fields
++ * @sb: superblock structure
++ *
++ * This function does not include the cleanup for apfs_fill_super(), which
++ * already took place inside ->put_super() (or maybe inside apfs_fill_super()
++ * itself if the mount failed).
++ */
++static void apfs_free_sb_info(struct super_block *sb)
++{
++	struct apfs_sb_info *sbi = NULL;
++
++	sbi = APFS_SB(sb);
++	apfs_free_main_super(sbi);
++	sb->s_fs_info = NULL;
++
++	kfree(sbi->s_snap_name);
++	sbi->s_snap_name = NULL;
++	if (sbi->s_dflt_pfk)
++		kfree(sbi->s_dflt_pfk);
++	kfree(sbi);
++	sbi = NULL;
 +}
 +
 +static void apfs_kill_sb(struct super_block *sb)
 +{
-+	dev_t anon_dev = APFS_SB(sb)->s_anon_dev;
++	struct apfs_sb_info *sbi = APFS_SB(sb);
 +
-+	generic_shutdown_super(sb);
-+	free_anon_bdev(anon_dev);
++	/*
++	 * We need to delist the superblock before freeing its info to avoid a
++	 * race with apfs_test_super(), but we can't call kill_super_notify()
++	 * from the driver. The available wrapper is kill_anon_super(), but our
++	 * s_dev is set to the actual device (that gets freed later along with
++	 * the container), not to the anon device that we keep on the sbi. So,
++	 * we change that before the call; this is safe because other mounters
++	 * won't revive this super, even if apfs_test_super() succeeds.
++	 */
++	sb->s_dev = sbi->s_anon_dev;
++	kill_anon_super(sb);
++
++	apfs_free_sb_info(sb);
 +}
 +
 +static struct file_system_type apfs_fs_type = {
@@ -24062,10 +24385,10 @@ index 000000000..be4f9df8f
 +};
 diff --git a/fs/apfs/transaction.c b/fs/apfs/transaction.c
 new file mode 100644
-index 000000000..ab0d51d2d
+index 000000000..25f9643cc
 --- /dev/null
 +++ b/fs/apfs/transaction.c
-@@ -0,0 +1,976 @@
+@@ -0,0 +1,988 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Copyright (C) 2019 Ernesto A. Fernández <ernesto.mnd.fernandez@gmail.com>
@@ -24169,13 +24492,18 @@ index 000000000..ab0d51d2d
 +static int apfs_read_single_ephemeral_object(struct super_block *sb, struct apfs_checkpoint_mapping *map)
 +{
 +	struct apfs_nxsb_info *nxi = APFS_NXI(sb);
++	struct apfs_nx_superblock *raw_sb = NULL;
 +	struct apfs_ephemeral_object_info *list = NULL;
 +	struct buffer_head *bh = NULL;
 +	char *object = NULL;
 +	int count;
-+	u32 size;
-+	u64 bno, oid;
-+	int err, i;
++	u32 data_blks, size;
++	u64 data_base, bno, oid;
++	int err, i, data_idx;
++
++	raw_sb = nxi->nx_raw;
++	data_base = le64_to_cpu(raw_sb->nx_xp_data_base);
++	data_blks = le32_to_cpu(raw_sb->nx_xp_data_blocks);
 +
 +	list = nxi->nx_eph_list;
 +	count = nxi->nx_eph_count;
@@ -24203,8 +24531,9 @@ index 000000000..ab0d51d2d
 +	if (!object)
 +		return -ENOMEM;
 +
++	data_idx = bno - data_base;
 +	for (i = 0; i < size >> sb->s_blocksize_bits; ++i) {
-+		bh = apfs_sb_bread(sb, bno + i);
++		bh = apfs_sb_bread(sb, data_base + data_idx);
 +		if (!bh) {
 +			apfs_err(sb, "failed to read ephemeral block");
 +			err = -EIO;
@@ -24213,6 +24542,9 @@ index 000000000..ab0d51d2d
 +		memcpy(object + (i << sb->s_blocksize_bits), bh->b_data, sb->s_blocksize);
 +		brelse(bh);
 +		bh = NULL;
++		/* Somewhat surprisingly, objects can wrap around */
++		if (++data_idx == data_blks)
++			data_idx = 0;
 +	}
 +
 +	/*
@@ -24353,10 +24685,8 @@ index 000000000..ab0d51d2d
 +	 * (TODO).
 +	 */
 +	down_write(&nxi->nx_big_sem);
-+	mutex_lock(&nxs_mutex);
 +	if (!sb || sb->s_flags & SB_RDONLY) {
 +		/* The commit already took place, or there was an abort */
-+		mutex_unlock(&nxs_mutex);
 +		up_write(&nxi->nx_big_sem);
 +		return;
 +	}
@@ -24398,11 +24728,9 @@ index 000000000..ab0d51d2d
 +	int err;
 +
 +	down_write(&nxi->nx_big_sem);
-+	mutex_lock(&nxs_mutex); /* Don't mount during a transaction */
 +
 +	if (sb->s_flags & SB_RDONLY) {
 +		/* A previous transaction has failed; this should be rare */
-+		mutex_unlock(&nxs_mutex);
 +		up_write(&nxi->nx_big_sem);
 +		return -EROFS;
 +	}
@@ -24414,7 +24742,6 @@ index 000000000..ab0d51d2d
 +	if (!nxi->nx_eph_list) {
 +		err = apfs_read_ephemeral_objects(sb);
 +		if (err) {
-+			mutex_unlock(&nxs_mutex);
 +			up_write(&nxi->nx_big_sem);
 +			apfs_err(sb, "failed to read the ephemeral objects");
 +			return err;
@@ -24508,14 +24835,12 @@ index 000000000..ab0d51d2d
 +		list_del_init(&ai->i_list);
 +
 +		nx_trans->t_state |= APFS_NX_TRANS_COMMITTING;
-+		mutex_unlock(&nxs_mutex);
 +		up_write(&nxi->nx_big_sem);
 +
 +		/* Unlocked, so it may call evict() and wait for writeback */
 +		iput(inode);
 +
 +		down_write(&nxi->nx_big_sem);
-+		mutex_lock(&nxs_mutex);
 +		nx_trans->t_state = 0;
 +
 +		/* Transaction aborted during writeback, error code is lost */
@@ -24539,18 +24864,24 @@ index 000000000..ab0d51d2d
 +static int apfs_write_single_ephemeral_object(struct super_block *sb, struct apfs_obj_phys *obj_raw, const struct apfs_checkpoint_mapping *map)
 +{
 +	struct apfs_nxsb_info *nxi = APFS_NXI(sb);
++	struct apfs_nx_superblock *raw_sb = NULL;
 +	struct buffer_head *bh = NULL;
-+	u64 bno;
-+	u32 size;
-+	int err, i;
++	u64 data_base, bno;
++	u32 data_blks, size;
++	int err, i, data_idx;
++
++	raw_sb = nxi->nx_raw;
++	data_base = le64_to_cpu(raw_sb->nx_xp_data_base);
++	data_blks = le32_to_cpu(raw_sb->nx_xp_data_blocks);
 +
 +	bno = le64_to_cpu(map->cpm_paddr);
 +	size = le32_to_cpu(map->cpm_size);
 +	obj_raw->o_xid = cpu_to_le64(nxi->nx_xid);
 +	apfs_multiblock_set_csum((char *)obj_raw, size);
 +
++	data_idx = bno - data_base;
 +	for (i = 0; i < size >> sb->s_blocksize_bits; ++i) {
-+		bh = apfs_getblk(sb, bno + i);
++		bh = apfs_getblk(sb, data_base + data_idx);
 +		if (!bh) {
 +			apfs_err(sb, "failed to map ephemeral block");
 +			return -EIO;
@@ -24564,6 +24895,9 @@ index 000000000..ab0d51d2d
 +		memcpy(bh->b_data, (char *)obj_raw + (i << sb->s_blocksize_bits), sb->s_blocksize);
 +		brelse(bh);
 +		bh = NULL;
++		/* Somewhat surprisingly, objects can wrap around */
++		if (++data_idx == data_blks)
++			data_idx = 0;
 +	}
 +	return 0;
 +}
@@ -24639,15 +24973,6 @@ index 000000000..ab0d51d2d
 +		eph_info = &nxi->nx_eph_list[i];
 +		data_next = (data_index + data_len) % data_blks;
 +		obj_blkcnt = eph_info->size >> sb->s_blocksize_bits;
-+		if (obj_blkcnt > data_blks - data_next) {
-+			/*
-+			 * This multiblock object does not fit in what's left
-+			 * of the ring buffer, so move it to the beginning and
-+			 * leave some empty blocks.
-+			 */
-+			data_len += data_blks - data_next;
-+			data_next = 0;
-+		}
 +
 +		err = apfs_create_cpoint_map(sb, cpm, eph_info->object, data_base + data_next, eph_info->size);
 +		if (err) {
@@ -24706,7 +25031,6 @@ index 000000000..ab0d51d2d
 +	struct apfs_nx_transaction *nx_trans = &nxi->nx_transaction;
 +	struct apfs_bh_info *bhi, *tmp;
 +	int err = 0;
-+	u32 bmap_idx;
 +
 +	ASSERT(!(sb->s_flags & SB_RDONLY));
 +
@@ -24730,6 +25054,16 @@ index 000000000..ab0d51d2d
 +		}
 +		sm->sm_free_cache_base = sm->sm_free_cache_blkcnt = 0;
 +	}
++	/*
++	 * Writing the ip bitmaps modifies the spaceman, so it must happen
++	 * before we commit the ephemeral objects. It must also happen after we
++	 * flush the free queue, in case the last freed range was in the ip.
++	 */
++	err = apfs_write_ip_bitmaps(sb);
++	if (err) {
++		apfs_err(sb, "failed to commit the ip bitmaps");
++		return err;
++	}
 +	err = apfs_write_ephemeral_objects(sb);
 +	if (err)
 +		return err;
@@ -24750,7 +25084,11 @@ index 000000000..ab0d51d2d
 +	}
 +	list_for_each_entry_safe(bhi, tmp, &nx_trans->t_buffers, list) {
 +		struct buffer_head *bh = bhi->bh;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
++		struct folio *folio = NULL;
++#else
 +		struct page *page = NULL;
++#endif
 +		bool is_metadata;
 +
 +		ASSERT(buffer_trans(bh));
@@ -24770,39 +25108,50 @@ index 000000000..ab0d51d2d
 +		kfree(bhi);
 +		bhi = NULL;
 +
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
++		folio = page_folio(bh->b_page);
++		folio_get(folio);
++#else
 +		page = bh->b_page;
 +		get_page(page);
++#endif
 +
 +		is_metadata = buffer_csum(bh);
 +		clear_buffer_csum(bh);
 +		put_bh(bh);
 +		bh = NULL;
 +
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
++		folio_lock(folio);
++		folio_mkclean(folio);
++#else
 +		/* Future writes to mmapped areas should fault for CoW */
 +		lock_page(page);
 +		page_mkclean(page);
++#endif
 +		/* XXX: otherwise, the page cache fills up and crashes the machine */
 +		if (!is_metadata) {
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
++			try_to_free_buffers(folio);
++#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
 +			try_to_free_buffers(page_folio(page));
 +#else
 +			try_to_free_buffers(page);
 +#endif
 +		}
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
++		folio_unlock(folio);
++		folio_put(folio);
++#else
 +		unlock_page(page);
 +		put_page(page);
++#endif
 +	}
 +	err = apfs_checkpoint_end(sb);
 +	if (err) {
 +		apfs_err(sb, "failed to end the checkpoint");
 +		return err;
 +	}
-+
-+	for (bmap_idx = 0; bmap_idx < APFS_SM(sb)->sm_ip_bmaps_count; ++bmap_idx) {
-+		brelse(APFS_SM(sb)->sm_ip_bmaps[bmap_idx]);
-+		APFS_SM(sb)->sm_ip_bmaps[bmap_idx] = NULL;
-+	}
-+	APFS_SM(sb)->sm_raw = NULL;
 +
 +	nx_trans->t_starts_count = 0;
 +	nx_trans->t_buffers_count = 0;
@@ -24902,7 +25251,6 @@ index 000000000..ab0d51d2d
 +		mod_delayed_work(system_wq, &trans->t_work, msecs_to_jiffies(100));
 +	}
 +
-+	mutex_unlock(&nxs_mutex);
 +	up_write(&nxi->nx_big_sem);
 +	return 0;
 +}
@@ -24989,14 +25337,11 @@ index 000000000..ab0d51d2d
 +	struct apfs_nx_transaction *nx_trans = &nxi->nx_transaction;
 +	struct apfs_bh_info *bhi, *tmp;
 +	struct apfs_inode_info *ai, *ai_tmp;
-+	struct apfs_spaceman *sm = NULL;
-+	u32 bmap_idx;
 +
 +	if (sb->s_flags & SB_RDONLY) {
 +		/* Transaction already aborted, do nothing */
 +		ASSERT(list_empty(&nx_trans->t_inodes));
 +		ASSERT(list_empty(&nx_trans->t_buffers));
-+		mutex_unlock(&nxs_mutex);
 +		up_write(&nxi->nx_big_sem);
 +		return;
 +	}
@@ -25019,22 +25364,12 @@ index 000000000..ab0d51d2d
 +		kfree(bhi);
 +	}
 +
-+	sm = APFS_SM(sb);
-+	if (sm) {
-+		for (bmap_idx = 0; bmap_idx < sm->sm_ip_bmaps_count; ++bmap_idx) {
-+			brelse(sm->sm_ip_bmaps[bmap_idx]);
-+			sm->sm_ip_bmaps[bmap_idx] = NULL;
-+		}
-+		APFS_SM(sb)->sm_raw = NULL;
-+	}
-+
 +	/*
 +	 * It's not possible to undo in-memory changes from old operations in
 +	 * the aborted transaction. To avoid corruption, never write again.
 +	 */
 +	apfs_force_readonly(nxi);
 +
-+	mutex_unlock(&nxs_mutex);
 +	up_write(&nxi->nx_big_sem);
 +
 +	list_for_each_entry_safe(ai, ai_tmp, &nx_trans->t_inodes, i_list) {
@@ -25044,10 +25379,10 @@ index 000000000..ab0d51d2d
 +}
 diff --git a/fs/apfs/unicode.c b/fs/apfs/unicode.c
 new file mode 100644
-index 000000000..d17064e1f
+index 000000000..7baf4305b
 --- /dev/null
 +++ b/fs/apfs/unicode.c
-@@ -0,0 +1,3157 @@
+@@ -0,0 +1,3156 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Copyright (C) 2018 Ernesto A. Fernández <ernesto.mnd.fernandez@gmail.com>
@@ -25062,9 +25397,8 @@ index 000000000..d17064e1f
 +#include <linux/types.h>
 +#include <linux/nls.h>
 +#include <linux/ctype.h>
++#include <linux/version.h>
 +#include "unicode.h"
-+
-+#define MIN(X, Y)	((X) <= (Y) ? (X) : (Y))
 +
 +/* The arrays of unicode data are defined at the bottom of the file */
 +/* TODO: would a single trie with all the data be more efficient? */
@@ -25284,7 +25618,7 @@ index 000000000..d17064e1f
 +	while (1) {
 +		if (!total_len || !*utf8str)
 +			return norm_len;
-+		utf8len = utf8_to_utf32(utf8str, MIN(total_len, 4), &utf32char);
++		utf8len = utf8_to_utf32(utf8str, min(total_len, 4U), &utf32char);
 +		if (utf8len < 0) /* Invalid unicode; don't normalize anything */
 +			return 0;
 +
@@ -25356,7 +25690,7 @@ index 000000000..d17064e1f
 +		unicode_t utf32char;
 +		int utf8len, pos;
 +
-+		utf8len = utf8_to_utf32(utf8str, MIN(total_len, 4), &utf32char);
++		utf8len = utf8_to_utf32(utf8str, min(total_len, 4U), &utf32char);
 +		for (pos = 0;; pos++, str_pos++) {
 +			unicode_t utf32norm;
 +			u8 ccc;
@@ -28240,11 +28574,11 @@ index 000000000..e3b7edc51
 +#endif	/* _APFS_UNICODE_H */
 diff --git a/fs/apfs/version.h b/fs/apfs/version.h
 new file mode 100644
-index 000000000..3a8789fc1
+index 000000000..68cc43af9
 --- /dev/null
 +++ b/fs/apfs/version.h
 @@ -0,0 +1 @@
-+#define GIT_COMMIT	"v0.3.10"
++#define GIT_COMMIT	"v0.3.12"
 diff --git a/fs/apfs/xattr.c b/fs/apfs/xattr.c
 new file mode 100644
 index 000000000..0de1db140
@@ -29351,5 +29685,5 @@ index 000000000..b8cbe17fd
 +	return total_len;
 +}
 -- 
-2.45.2
+2.47.0
 
